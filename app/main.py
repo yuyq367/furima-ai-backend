@@ -235,3 +235,101 @@ def get_product(product_id: int):
         )
 
     return dict(product)
+
+@app.post("/products/{product_id}/purchase")
+def purchase_product(
+    product_id: int,
+    decoded_token: dict = Depends(verify_firebase_token),
+):
+    firebase_uid = decoded_token["uid"]
+
+    with engine.begin() as connection:
+        buyer = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if buyer is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User is not registered in database",
+            )
+
+        product = connection.execute(
+            text(
+                """
+                SELECT id, seller_id, status
+                FROM products
+                WHERE id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        if product is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found",
+            )
+
+        if product["status"] == "sold":
+            raise HTTPException(
+                status_code=400,
+                detail="Product is already sold",
+            )
+
+        if product["seller_id"] == buyer["id"]:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot purchase your own product",
+            )
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO purchases (product_id, buyer_id)
+                VALUES (:product_id, :buyer_id)
+                """
+            ),
+            {
+                "product_id": product_id,
+                "buyer_id": buyer["id"],
+            },
+        )
+
+        connection.execute(
+            text(
+                """
+                UPDATE products
+                SET status = 'sold'
+                WHERE id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        )
+
+        purchase = connection.execute(
+            text(
+                """
+                SELECT
+                    purchases.id,
+                    purchases.product_id,
+                    purchases.buyer_id,
+                    purchases.purchased_at,
+                    products.status
+                FROM purchases
+                JOIN products
+                    ON purchases.product_id = products.id
+                WHERE purchases.product_id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        return dict(purchase)
