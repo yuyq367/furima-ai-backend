@@ -200,3 +200,38 @@ def create_product(
         ).mappings().first()
 
         return dict(product)
+    
+@app.get("/products/{product_id}")
+def get_product(product_id: int):
+    with engine.connect() as connection:
+        product = connection.execute(
+            text(
+                """
+                SELECT
+                    products.id,
+                    products.seller_id,
+                    products.title,
+                    products.description,
+                    products.price,
+                    products.image_url,
+                    products.category,
+                    products.condition_label,
+                    products.status,
+                    products.created_at,
+                    users.username AS seller_username
+                FROM products
+                JOIN users
+                    ON products.seller_id = users.id
+                WHERE products.id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found",
+        )
+
+    return dict(product)
