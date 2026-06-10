@@ -333,3 +333,103 @@ def purchase_product(
         ).mappings().first()
 
         return dict(purchase)
+    
+@app.get("/users/me/products")
+def get_my_products(decoded_token: dict = Depends(verify_firebase_token)):
+    firebase_uid = decoded_token["uid"]
+
+    with engine.connect() as connection:
+        user = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User is not registered in database",
+            )
+
+        products = connection.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    seller_id,
+                    title,
+                    description,
+                    price,
+                    image_url,
+                    category,
+                    condition_label,
+                    status,
+                    created_at
+                FROM products
+                WHERE seller_id = :seller_id
+                ORDER BY created_at DESC
+                """
+            ),
+            {"seller_id": user["id"]},
+        ).mappings().all()
+
+    return [dict(product) for product in products]
+
+@app.get("/users/me/purchases")
+def get_my_purchases(decoded_token: dict = Depends(verify_firebase_token)):
+    firebase_uid = decoded_token["uid"]
+
+    with engine.connect() as connection:
+        user = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User is not registered in database",
+            )
+
+        purchases = connection.execute(
+            text(
+                """
+                SELECT
+                    purchases.id AS purchase_id,
+                    purchases.product_id,
+                    purchases.buyer_id,
+                    purchases.purchased_at,
+                    products.seller_id,
+                    products.title,
+                    products.description,
+                    products.price,
+                    products.image_url,
+                    products.category,
+                    products.condition_label,
+                    products.status,
+                    products.created_at,
+                    users.username AS seller_username
+                FROM purchases
+                JOIN products
+                    ON purchases.product_id = products.id
+                JOIN users
+                    ON products.seller_id = users.id
+                WHERE purchases.buyer_id = :buyer_id
+                ORDER BY purchases.purchased_at DESC
+                """
+            ),
+            {"buyer_id": user["id"]},
+        ).mappings().all()
+
+    return [dict(purchase) for purchase in purchases]
