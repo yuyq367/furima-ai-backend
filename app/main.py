@@ -31,8 +31,54 @@ def check_db_connection():
 
 @app.get("/auth/me")
 def get_current_user(decoded_token: dict = Depends(verify_firebase_token)):
-    return {
-        "firebase_uid": decoded_token["uid"],
-        "email": decoded_token.get("email"),
-        "name": decoded_token.get("name"),
-    }
+    firebase_uid = decoded_token["uid"]
+    email = decoded_token.get("email")
+
+    if email:
+        username = email.split("@")[0]
+    else:
+        username = f"user_{firebase_uid[:8]}"
+
+    with engine.begin() as connection:
+        existing_user = connection.execute(
+            text(
+                """
+                SELECT id, firebase_uid, username, email
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if existing_user:
+            return dict(existing_user)
+
+        result = connection.execute(
+            text(
+                """
+                INSERT INTO users (firebase_uid, username, email)
+                VALUES (:firebase_uid, :username, :email)
+                """
+            ),
+            {
+                "firebase_uid": firebase_uid,
+                "username": username,
+                "email": email,
+            },
+        )
+
+        new_user_id = result.lastrowid
+
+        new_user = connection.execute(
+            text(
+                """
+                SELECT id, firebase_uid, username, email
+                FROM users
+                WHERE id = :id
+                """
+            ),
+            {"id": new_user_id},
+        ).mappings().first()
+
+        return dict(new_user)
