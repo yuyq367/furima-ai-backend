@@ -82,3 +82,28 @@ def get_current_user(decoded_token: dict = Depends(verify_firebase_token)):
         ).mappings().first()
 
         return dict(new_user)
+    
+@app.get("/products")
+def get_products():
+    with engine.connect() as connection:
+        products = connection.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    seller_id,
+                    title,
+                    description,
+                    price,
+                    image_url,
+                    category,
+                    condition_label,
+                    status,
+                    created_at
+                FROM products
+                ORDER BY created_at DESC
+                """
+            )
+        ).mappings().all()
+
+    return [dict(product) for product in products]
