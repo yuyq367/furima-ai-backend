@@ -1,11 +1,17 @@
+import os
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
 from sqlalchemy import text
+
 from app.database import engine
 from app.firebase_auth import verify_firebase_token
 
+
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -17,6 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ProductCreateRequest(BaseModel):
     title: str
     description: str
@@ -24,6 +31,24 @@ class ProductCreateRequest(BaseModel):
     image_url: str | None = None
     category: str
     condition_label: str
+
+class GenerateProductDescriptionRequest(BaseModel):
+    title: str
+    category: str
+    condition_label: str
+    price: int | None = None
+
+
+class GenerateProductDescriptionResponse(BaseModel):
+    description: str
+
+def row_to_dict(row):
+    return dict(row.items())
+
+
+def rows_to_dicts(rows):
+    return [row_to_dict(row) for row in rows]
+
 
 @app.get("/")
 def read_root():
@@ -37,6 +62,7 @@ def check_db_connection():
         value = result.scalar()
 
     return {"db": "connected", "result": value}
+
 
 @app.get("/auth/me")
 def get_current_user(decoded_token: dict = Depends(verify_firebase_token)):
@@ -60,8 +86,8 @@ def get_current_user(decoded_token: dict = Depends(verify_firebase_token)):
             {"firebase_uid": firebase_uid},
         ).mappings().first()
 
-        if existing_user:
-            return dict(existing_user)
+        if existing_user is not None:
+            return row_to_dict(existing_user)
 
         result = connection.execute(
             text(
@@ -90,8 +116,15 @@ def get_current_user(decoded_token: dict = Depends(verify_firebase_token)):
             {"id": new_user_id},
         ).mappings().first()
 
-        return dict(new_user)
-    
+        if new_user is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create user",
+            )
+
+        return row_to_dict(new_user)
+
+
 @app.get("/products")
 def get_products():
     with engine.connect() as connection:
@@ -115,7 +148,8 @@ def get_products():
             )
         ).mappings().all()
 
-    return [dict(product) for product in products]
+    return rows_to_dicts(products)
+
 
 @app.post("/products")
 def create_product(
@@ -199,8 +233,15 @@ def create_product(
             {"id": new_product_id},
         ).mappings().first()
 
-        return dict(product)
-    
+        if product is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create product",
+            )
+
+        return row_to_dict(product)
+
+
 @app.get("/products/{product_id}")
 def get_product(product_id: int):
     with engine.connect() as connection:
@@ -234,7 +275,8 @@ def get_product(product_id: int):
             detail="Product not found",
         )
 
-    return dict(product)
+    return row_to_dict(product)
+
 
 @app.post("/products/{product_id}/purchase")
 def purchase_product(
@@ -332,8 +374,15 @@ def purchase_product(
             {"product_id": product_id},
         ).mappings().first()
 
-        return dict(purchase)
-    
+        if purchase is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create purchase",
+            )
+
+        return row_to_dict(purchase)
+
+
 @app.get("/users/me/products")
 def get_my_products(decoded_token: dict = Depends(verify_firebase_token)):
     firebase_uid = decoded_token["uid"]
@@ -378,7 +427,8 @@ def get_my_products(decoded_token: dict = Depends(verify_firebase_token)):
             {"seller_id": user["id"]},
         ).mappings().all()
 
-    return [dict(product) for product in products]
+    return rows_to_dicts(products)
+
 
 @app.get("/users/me/purchases")
 def get_my_purchases(decoded_token: dict = Depends(verify_firebase_token)):
@@ -432,4 +482,84 @@ def get_my_purchases(decoded_token: dict = Depends(verify_firebase_token)):
             {"buyer_id": user["id"]},
         ).mappings().all()
 
-    return [dict(purchase) for purchase in purchases]
+    return rows_to_dicts(purchases)
+
+@app.post(
+    "/ai/product-description",
+    response_model=GenerateProductDescriptionResponse,
+)
+def generate_product_description(request: GenerateProductDescriptionRequest):
+    title = request.title.strip()
+    category = request.category.strip()
+    condition_label = request.condition_label.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="商品名を入力してください")
+
+    if not category:
+        raise HTTPException(status_code=400, detail="カテゴリを選択してください")
+
+    if not condition_label:
+        raise HTTPException(status_code=400, detail="商品の状態を選択してください")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY が設定されていません",
+        )
+
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_client = OpenAI(api_key=api_key)
+
+    price_text = (
+        f"{request.price:,}円"
+        if request.price is not None and request.price > 0
+        else "未設定"
+    )
+
+    prompt = f"""
+以下の商品情報をもとに、フリマアプリの商品説明文を日本語で作成してください。
+
+条件:
+- 120文字から200文字程度
+- 誇張しすぎない
+- 丁寧で自然な文章
+- 購入者が知りたい情報が伝わる文章
+- 絵文字は使わない
+- 商品説明文だけを出力する
+- 箇条書きではなく文章で書く
+
+商品情報:
+商品名: {title}
+カテゴリ: {category}
+商品の状態: {condition_label}
+価格: {price_text}
+"""
+
+    try:
+        response = openai_client.responses.create(
+            model=openai_model,
+            instructions="あなたはフリマアプリの商品説明文を作るアシスタントです。",
+            input=prompt,
+        )
+
+        description = response.output_text.strip()
+
+        if not description:
+            raise HTTPException(
+                status_code=500,
+                detail="説明文を生成できませんでした",
+            )
+
+        return GenerateProductDescriptionResponse(description=description)
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(error)
+        raise HTTPException(
+            status_code=500,
+            detail="AI説明文の生成に失敗しました",
+        )
