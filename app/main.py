@@ -32,6 +32,14 @@ class ProductCreateRequest(BaseModel):
     category: str
     condition_label: str
 
+class ProductUpdateRequest(BaseModel):
+    title: str
+    description: str
+    price: int
+    image_url: str | None = None
+    category: str
+    condition_label: str
+
 class GenerateProductDescriptionRequest(BaseModel):
     title: str
     category: str
@@ -277,6 +285,135 @@ def get_product(product_id: int):
 
     return row_to_dict(product)
 
+@app.put("/products/{product_id}")
+def update_product(
+    product_id: int,
+    request: ProductUpdateRequest,
+    decoded_token: dict = Depends(verify_firebase_token),
+):
+    firebase_uid = decoded_token["uid"]
+
+    title = request.title.strip()
+    description = request.description.strip()
+    category = request.category.strip()
+    condition_label = request.condition_label.strip()
+    image_url = request.image_url.strip() if request.image_url else None
+
+    if not title:
+        raise HTTPException(status_code=400, detail="商品名を入力してください")
+
+    if not description:
+        raise HTTPException(status_code=400, detail="商品説明を入力してください")
+
+    if request.price <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="価格は1円以上で入力してください",
+        )
+
+    if not category:
+        raise HTTPException(status_code=400, detail="カテゴリを選択してください")
+
+    if not condition_label:
+        raise HTTPException(status_code=400, detail="商品の状態を選択してください")
+
+    with engine.begin() as connection:
+        user = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User is not registered in database",
+            )
+
+        product = connection.execute(
+            text(
+                """
+                SELECT id, seller_id
+                FROM products
+                WHERE id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        if product is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found",
+            )
+
+        if product["seller_id"] != user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only update your own product",
+            )
+
+        connection.execute(
+            text(
+                """
+                UPDATE products
+                SET
+                    title = :title,
+                    description = :description,
+                    price = :price,
+                    image_url = :image_url,
+                    category = :category,
+                    condition_label = :condition_label
+                WHERE id = :product_id
+                """
+            ),
+            {
+                "product_id": product_id,
+                "title": title,
+                "description": description,
+                "price": request.price,
+                "image_url": image_url,
+                "category": category,
+                "condition_label": condition_label,
+            },
+        )
+
+        updated_product = connection.execute(
+            text(
+                """
+                SELECT
+                    products.id,
+                    products.seller_id,
+                    products.title,
+                    products.description,
+                    products.price,
+                    products.image_url,
+                    products.category,
+                    products.condition_label,
+                    products.status,
+                    products.created_at,
+                    users.username AS seller_username
+                FROM products
+                JOIN users
+                    ON products.seller_id = users.id
+                WHERE products.id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        if updated_product is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update product",
+            )
+
+        return row_to_dict(updated_product)
 
 @app.post("/products/{product_id}/purchase")
 def purchase_product(
