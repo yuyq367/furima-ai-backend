@@ -416,6 +416,89 @@ def update_product(
 
         return row_to_dict(updated_product)
 
+@app.delete("/products/{product_id}")
+def delete_product(
+    product_id: int,
+    decoded_token: dict = Depends(verify_firebase_token),
+):
+    firebase_uid = decoded_token["uid"]
+
+    with engine.begin() as connection:
+        user = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM users
+                WHERE firebase_uid = :firebase_uid
+                """
+            ),
+            {"firebase_uid": firebase_uid},
+        ).mappings().first()
+
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="User is not registered in database",
+            )
+
+        product = connection.execute(
+            text(
+                """
+                SELECT id, seller_id, status
+                FROM products
+                WHERE id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        if product is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found",
+            )
+
+        if product["seller_id"] != user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="You can only delete your own product",
+            )
+
+        if product["status"] == "sold":
+            raise HTTPException(
+                status_code=400,
+                detail="Sold products cannot be deleted",
+            )
+
+        purchase = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM purchases
+                WHERE product_id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        ).mappings().first()
+
+        if purchase is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Purchased products cannot be deleted",
+            )
+
+        connection.execute(
+            text(
+                """
+                DELETE FROM products
+                WHERE id = :product_id
+                """
+            ),
+            {"product_id": product_id},
+        )
+
+        return {"message": "Product deleted"}
+
 @app.post("/products/{product_id}/purchase")
 def purchase_product(
     product_id: int,
