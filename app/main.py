@@ -51,6 +51,9 @@ class GenerateProductDescriptionRequest(BaseModel):
 class GenerateProductDescriptionResponse(BaseModel):
     description: str
 
+class ProductRecommendationRequest(BaseModel):
+    query: str
+
 def row_to_dict(row):
     return dict(row.items())
 
@@ -58,6 +61,92 @@ def row_to_dict(row):
 def rows_to_dicts(rows):
     return [row_to_dict(row) for row in rows]
 
+def build_recommendation_text(product):
+    title = product.get("title") or ""
+    description = product.get("description") or ""
+    category = product.get("category") or ""
+    condition_label = product.get("condition_label") or ""
+    price = product.get("price")
+
+    price_text = f"{price}円" if price is not None else "未設定"
+
+    return f"""
+商品名: {title}
+説明: {description}
+カテゴリ: {category}
+状態: {condition_label}
+価格: {price_text}
+""".strip()
+
+def cosine_similarity(left_vector, right_vector):
+    dot_product = sum(
+        left_value * right_value
+        for left_value, right_value in zip(left_vector, right_vector)
+    )
+
+    left_norm = sum(value * value for value in left_vector) ** 0.5
+    right_norm = sum(value * value for value in right_vector) ** 0.5
+
+    if left_norm == 0 or right_norm == 0:
+        return 0
+
+    return dot_product / (left_norm * right_norm)
+
+CATEGORY_KEYWORDS = {
+    "衣類": ["服", "シャツ", "ニット", "アウター", "パンツ", "スカート", "ワンピース"],
+    "靴・バッグ": ["バッグ", "カバン", "鞄", "リュック", "ショルダー", "トート", "靴", "スニーカー"],
+    "アクセサリー": ["アクセサリー", "時計", "腕時計", "ネックレス", "リング", "ピアス"],
+    "本・漫画": ["本", "漫画", "参考書", "教科書", "小説"],
+    "ゲーム・おもちゃ": ["ゲーム", "おもちゃ", "フィギュア"],
+    "家電・スマホ": ["家電", "スマホ", "イヤホン", "バッテリー", "充電器", "ガジェット"],
+    "インテリア": ["インテリア", "家具", "ライト", "収納"],
+    "コスメ・美容": ["コスメ", "美容", "化粧品", "スキンケア"],
+    "スポーツ・アウトドア": ["スポーツ", "アウトドア", "キャンプ", "運動"],
+    "食品": ["食品", "お菓子", "飲み物"],
+    "チケット": ["チケット", "券"],
+}
+
+
+def infer_requested_categories(query):
+    matched_categories = []
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in query for keyword in keywords):
+            matched_categories.append(category)
+
+    return matched_categories
+
+
+def calculate_recommendation_bonus(query, product):
+    requested_categories = infer_requested_categories(query)
+
+    product_category = product.get("category") or ""
+    product_text = f"""
+{product.get("title") or ""}
+{product.get("description") or ""}
+{product.get("category") or ""}
+{product.get("condition_label") or ""}
+""".lower()
+
+    bonus = 0
+
+    if requested_categories:
+        if product_category in requested_categories:
+            bonus += 0.25
+        else:
+            bonus -= 0.12
+
+    for category in requested_categories:
+        keywords = CATEGORY_KEYWORDS.get(category, [])
+
+        for keyword in keywords:
+            if keyword in product_text:
+                bonus += 0.08
+
+            if keyword in query and keyword in product_text:
+                bonus += 0.12
+
+    return bonus
 
 @app.get("/")
 def read_root():
@@ -784,3 +873,97 @@ def generate_product_description(request: GenerateProductDescriptionRequest):
             status_code=500,
             detail="AI説明文の生成に失敗しました",
         )
+    
+@app.post("/ai/product-recommendations")
+def recommend_products(request: ProductRecommendationRequest):
+    query = request.query.strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="探したい商品の条件を入力してください",
+        )
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY が設定されていません",
+        )
+
+    embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    openai_client = OpenAI(api_key=api_key)
+
+    with engine.connect() as connection:
+        products = connection.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    seller_id,
+                    title,
+                    description,
+                    price,
+                    image_url,
+                    category,
+                    condition_label,
+                    status,
+                    created_at
+                FROM products
+                WHERE status = 'available'
+                ORDER BY created_at DESC
+                """
+            )
+        ).mappings().all()
+
+    if len(products) == 0:
+        return {
+            "message": "現在おすすめできる商品がありません。",
+            "products": [],
+        }
+
+    product_dicts = rows_to_dicts(products)
+
+    recommendation_texts = [f"ユーザーが探している商品: {query}"]
+
+    for product in product_dicts:
+        recommendation_texts.append(build_recommendation_text(product))
+
+    try:
+        embedding_response = openai_client.embeddings.create(
+            model=embedding_model,
+            input=recommendation_texts,
+        )
+    except Exception as error:
+        print(error)
+        raise HTTPException(
+            status_code=500,
+            detail="商品のレコメンド生成に失敗しました",
+        )
+
+    embeddings = [item.embedding for item in embedding_response.data]
+    query_embedding = embeddings[0]
+    product_embeddings = embeddings[1:]
+
+    recommended_products = []
+
+    for product, product_embedding in zip(product_dicts, product_embeddings):
+        embedding_score = cosine_similarity(query_embedding, product_embedding)
+        keyword_bonus = calculate_recommendation_bonus(query, product)
+        final_score = embedding_score + keyword_bonus
+
+        recommended_product = product.copy()
+        recommended_product["recommendation_score"] = round(final_score, 4)
+
+        recommended_products.append(recommended_product)
+
+    recommended_products.sort(
+        key=lambda product: product["recommendation_score"],
+        reverse=True,
+    )
+
+    return {
+        "message": "条件に近い商品をおすすめ順に表示します。",
+        "products": recommended_products[:5],
+    }
