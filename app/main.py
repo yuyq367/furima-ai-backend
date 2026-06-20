@@ -1,3 +1,4 @@
+import json
 import os
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -148,6 +149,141 @@ def calculate_recommendation_bonus(query, product):
 
     return bonus
 
+def build_recommendation_reason(query, product):
+    requested_categories = infer_requested_categories(query)
+    product_category = product.get("category") or ""
+    product_title = product.get("title") or ""
+
+    if requested_categories and product_category in requested_categories:
+        return (
+            f"「{product_title}」はカテゴリが「{product_category}」で、"
+            "入力された条件と関連が強い商品として上位に表示しています。"
+        )
+
+    if requested_categories:
+        categories_text = "・".join(requested_categories)
+
+        return (
+            f"カテゴリは「{categories_text}」とは異なりますが、"
+            "商品説明や用途の近さから関連度が高い商品としておすすめしています。"
+        )
+
+    return (
+        "入力された文章と、商品名・説明文・カテゴリなどの意味的な近さをもとにおすすめしています。"
+    )
+
+
+def build_recommendation_message(query):
+    requested_categories = infer_requested_categories(query)
+
+    if requested_categories:
+        categories_text = "・".join(requested_categories)
+
+        return (
+            f"「{query}」という条件から、{categories_text}に近い商品を中心におすすめしています。"
+        )
+
+    return (
+        f"「{query}」という条件に対して、商品説明やカテゴリの意味的な近さをもとにおすすめしています。"
+    )
+
+def parse_json_text(text):
+    cleaned_text = text.strip()
+
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text.removeprefix("```json").strip()
+
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text.removeprefix("```").strip()
+
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text.removesuffix("```").strip()
+
+    return json.loads(cleaned_text)
+
+
+def generate_recommendation_reasons_with_ai(query, products):
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        return {}
+
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_client = OpenAI(api_key=api_key)
+
+    product_summaries = []
+
+    for product in products:
+        product_summaries.append(
+            {
+                "id": product.get("id"),
+                "rank": product.get("recommendation_rank"),
+                "title": product.get("title"),
+                "description": product.get("description"),
+                "price": product.get("price"),
+                "category": product.get("category"),
+                "condition_label": product.get("condition_label"),
+            }
+        )
+
+    prompt = f"""
+ユーザーはフリマアプリで以下の条件の商品を探しています。
+
+ユーザーの希望:
+{query}
+
+AIレコメンドで上位に表示する商品:
+{json.dumps(product_summaries, ensure_ascii=False)}
+
+それぞれの商品について、ユーザーにおすすめする理由を日本語で作成してください。
+
+条件:
+- 各商品につき1文から2文
+- ただのカテゴリ一致の説明にしない
+- 商品説明や状態、価格、用途を踏まえて、購入者に魅力が伝わる文章にする
+- 誇張しすぎない
+- 自然な接客文にする
+- 絵文字は使わない
+- 必ずJSONだけを返す
+- Markdownやコードブロックは使わない
+
+返すJSON形式:
+{{
+  "reasons": [
+    {{
+      "id": 商品ID,
+      "reason": "おすすめ理由"
+    }}
+  ]
+}}
+"""
+
+    try:
+        response = openai_client.responses.create(
+            model=openai_model,
+            instructions="あなたはフリマアプリの商品推薦理由を書くアシスタントです。",
+            input=prompt,
+        )
+
+        data = parse_json_text(response.output_text)
+
+        reason_by_product_id = {}
+
+        for item in data.get("reasons", []):
+            product_id = item.get("id")
+            reason = item.get("reason")
+
+            if product_id is None or not reason:
+                continue
+
+            reason_by_product_id[int(product_id)] = reason
+
+        return reason_by_product_id
+
+    except Exception as error:
+        print(error)
+        return {}
+    
 @app.get("/")
 def read_root():
     return {"message": "Hello, Furima AI"}
@@ -963,7 +1099,27 @@ def recommend_products(request: ProductRecommendationRequest):
         reverse=True,
     )
 
+    top_recommended_products = recommended_products[:5]
+
+    for index, product in enumerate(top_recommended_products, start=1):
+        product["recommendation_rank"] = index
+
+    ai_reason_by_product_id = generate_recommendation_reasons_with_ai(
+        query,
+        top_recommended_products,
+    )
+
+    for product in top_recommended_products:
+        product_id = product["id"]
+
+        product["recommendation_reason"] = ai_reason_by_product_id.get(
+            product_id,
+        ) or build_recommendation_reason(
+            query,
+            product,
+        )
+
     return {
-        "message": "条件に近い商品をおすすめ順に表示します。",
-        "products": recommended_products[:5],
+        "message": build_recommendation_message(query),
+        "products": top_recommended_products,
     }
